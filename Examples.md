@@ -3,12 +3,14 @@
 * Current: Existing gRPC Python API
 * Option 1: Async API similar to existing gRPC Python API
 * Option 2: Brand new Async API
+* Option 3: Brand new Async API with explicit context and strong typing
 * Ideal: The most idealistic `asyncio` approach
 
 ## Motivation
 * Asynchronous processing perfectly fits IO-intensive gRPC use cases;
 * Resolve a long-living design flaw of thread exhaustion problem;
-* Performance is much better than the multi-threading model.
+* Performance is much better than the multi-threading model;
+* Provide a clean flow for passing metadata across RPC boundaries.
 
 # Client Side Examples
 ## Unary-Unary Call
@@ -29,7 +31,20 @@ async with grpc.insecure_channel('localhost:50051') as channel:
     response = await stub.Hi(...)
 ```
 
-### Ideal
+### Option 3
+
+```Python
+ctx = grpc.Context() \
+    .with_timeout_secs(5.0) \
+    .append_outgoing_metadata('key', 'value')
+# or: ctx.with_deadline(time.time() + 5.0)
+
+async with grpc.insecure_channel('localhost:50051') as channel:
+    stub = helloworld_pb2_grpc.AsyncGreeterClient(channel)
+    response = await stub.Hi(ctx, helloworld_pb2.GreetRequest(...))
+```
+
+### Dynamic
 
 ```Python
 helloworld_protos = grpc.proto('helloworld.proto')
@@ -124,7 +139,27 @@ except grpc.EOF:
     pass
 ```
 
-### Ideal
+### Option 3
+
+Use `Optional[helloworld_pb.Message]` as `receive` return type, it indicates
+that it is expected behavior for the stream to end, and forces a user to write
+code to handle this non-special condition.
+
+```Python
+stream = stub.StreamingHi(ctx)
+
+# In sending thread
+await call.send(proto_message)
+
+# In receiving thread
+while True:
+    response = await call.receive()
+    if response is None:
+        return
+    process(response)
+```
+
+### Dynamic
 
 ```Python
 helloworld_protos = grpc.proto('helloworld.proto')
@@ -166,6 +201,17 @@ server.start()
 await server.wait_for_termination()
 ```
 
+### Option 3
+
+```Python
+server = grpc.server()
+server.add_insecure_port(':50051')
+helloworld_pb2_grpc.add_AsyncGreeterServicer_to_server(Greeter(), server)
+# or helloworld_pb2_async_grpc.add_GreeterServicer_to_server(Greeter(), server)
+server.start()
+await server.wait_for_termination()
+```
+
 ## Unary-Unary Handler
 
 ### Current API
@@ -181,6 +227,18 @@ class Greeter(helloworld_pb2_grpc.GreeterServicer):
 ```Python
 class Greeter(helloworld_pb2_grpc.GreeterServicer):
     async def Hi(self, request, context):
+        response = await some_io_operation
+        return response
+```
+
+## Option 3
+
+```Python
+class Greeter(object):
+    async def Hi(self,
+                 ctx: grpc.Context,
+                 request: helloworld_pb2.HiRequest,
+        ) -> helloworld_pb2.HiResponse:
         response = await some_io_operation
         return response
 ```
@@ -277,6 +335,17 @@ class Greeter(helloworld_pb2_grpc.GreeterServicer):
                 await context.send(response)
 ```
 
+## Option 3
+
+```Python
+class Greeter(object):
+    async def StreamingHi(self, stream: helloworld_grpc_pb2.HiStream) -> None:
+        while True:
+            request = await stream.receive()
+            if request.needs_respond:
+                await stream.send(response)
+```
+
 # Generated File
 
 ## Current / Option 1
@@ -294,10 +363,75 @@ stub = helloworld_pb2_grpc.GreeterStub(channel)
 ## Option 2
 
 The new generated file is clean, and potentially enables us to add breaking
-changes. But currently, it provides almost zero value.
+changes.
+Allows using the same channel/server across both sync and async stubs.
 
 ```Python
 import helloworld_pb2_grpc_async
 channel = grpc.insecure_channel('localhost:50051'):
 stub = helloworld_pb2_grpc_async.GreeterStub(channel)
+```
+
+## Option 3
+
+Generate async stubs with `Async` prefix alonside synchronous ones.
+Allows using the same channel/server across both sync and async stubs, but can
+lead to namespace conflict.
+
+```Python
+import helloworld_pb2
+import helloworld_pb2_grpc
+channel = grpc.insecure_channel('localhost:50051'):
+stub = helloworld_pb2_grpc.AsyncGreeterStub(channel)
+```
+
+# Typing
+### Option 1
+Status quo, concrete abstract classes.
+
+```Python
+class GreeterServicer(object):
+    async def Hi(self,
+                 ctx: grpc.Context,
+                 request: helloworld_pb2.HiRequest,
+        ) -> helloworld_pb2.HiResponse:
+        raise NotImplementedError('Method not implemented!')
+
+    async def StreamingHi(self, stream: grpc.Stream) -> None:
+        msg = await stream.receive()
+        reveal_type(msg)  # observed type: Any
+        raise NotImplementedError('Method not implemented!')
+```
+
+### Option 2
+Use PEP 484 protocols. Abstracts implementation away at ≈zero runtime cost
+and simplifies ability to mock implementation for tests.
+
+Individual stream objects are strongly typed, which increases code
+maintainability and reduces chance of runtime bugs.
+
+```Python
+class HiStream(typing.Protocol):
+    def context(self) -> grpc.Context:
+        pass
+
+    async def receive(self) -> HiResponse:
+        pass
+
+    async def send(self, req: HiRequest) -> None:
+        pass
+
+    async def close_send(self) -> None:
+        pass
+
+
+class GreeterServicer(typing.Protocol):
+    async def Hi(self,
+                 ctx: grpc.Context,
+                 request: helloworld_pb2.HiRequest,
+        ) -> helloworld_pb2.HiResponse:
+        pass
+
+    async def StreamingHi(self, stream: helloworld_grpc_pb2.HiStream) -> None:
+        pass
 ```
